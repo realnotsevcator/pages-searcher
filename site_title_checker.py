@@ -6,7 +6,8 @@ import http.client
 import logging
 import re
 import ssl
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from itertools import chain
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -145,8 +146,7 @@ def prompt_site_title() -> str:
         return value
 
 
-def merge_targets(base_targets: Dict[str, Set[int]], extra_ports: Iterable[int]) -> List[Target]:
-    targets: List[Target] = []
+def merge_targets(base_targets: Dict[str, Set[int]], extra_ports: Iterable[int]) -> Iterable[Target]:
     extra_ports_set = set(extra_ports)
     for ip, ports in base_targets.items():
         all_ports = set(ports)
@@ -155,8 +155,7 @@ def merge_targets(base_targets: Dict[str, Set[int]], extra_ports: Iterable[int])
             print(f"No ports specified for IP {ip}. Skipping.")
             continue
         for port in sorted(all_ports):
-            targets.append(Target(ip=ip, port=port))
-    return targets
+            yield Target(ip=ip, port=port)
 
 
 def check_target(target: Target, expected_title: str) -> List[Tuple[str, bool, str]]:
@@ -235,6 +234,69 @@ def save_results(
         handle.write("\n".join(lines) + "\n")
 
 
+def _drain_completed(
+    futures: Dict[Future[List[Tuple[str, bool, str]]], Target],
+    output_path: Path,
+    *,
+    wait_for_one: bool,
+) -> int:
+    if not futures:
+        return 0
+
+    if wait_for_one:
+        done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
+    else:
+        done = {future for future in futures if future.done()}
+        if not done:
+            return 0
+
+    processed = 0
+    for future in done:
+        target = futures.pop(future)
+        try:
+            check_results = future.result()
+        except Exception:
+            LOGGER.exception("%s: unexpected error", target)
+            continue
+
+        for scheme, is_match, message in check_results:
+            status = "OK" if is_match else "FAIL"
+            log_message = f"[{scheme.upper()}] {target}: {status} — {message}"
+            if is_match:
+                LOGGER.info(log_message)
+            else:
+                LOGGER.warning(log_message)
+
+        save_results(output_path, target, check_results)
+        LOGGER.info("Results saved for %s", target.ip)
+        processed += 1
+
+    return processed
+
+
+def process_targets(
+    targets: Iterable[Target],
+    thread_count: int,
+    expected_title: str,
+    output_path: Path,
+) -> int:
+    total_processed = 0
+    max_pending = max(thread_count * 4, thread_count)
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures: Dict[Future[List[Tuple[str, bool, str]]], Target] = {}
+        for target in targets:
+            future = executor.submit(check_target, target, expected_title)
+            futures[future] = target
+            total_processed += _drain_completed(futures, output_path, wait_for_one=False)
+            while len(futures) >= max_pending:
+                total_processed += _drain_completed(futures, output_path, wait_for_one=True)
+
+        while futures:
+            total_processed += _drain_completed(futures, output_path, wait_for_one=True)
+
+    return total_processed
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -247,36 +309,19 @@ def main() -> None:
     ports = prompt_ports()
     expected_title = prompt_site_title()
 
-    targets = merge_targets(loaded_targets, ports)
-    if not targets:
+    targets_iter = iter(merge_targets(loaded_targets, ports))
+    try:
+        first_target = next(targets_iter)
+    except StopIteration:
         print("No targets to check. Exiting.")
         return
 
+    all_targets = chain([first_target], targets_iter)
     output_path = Path("output.txt")
     output_path.write_text("", encoding="utf-8")
-    LOGGER.info("Total targets to check: %d", len(targets))
-    with ThreadPoolExecutor(max_workers=thread_count) as executor:
-        future_to_target = {
-            executor.submit(check_target, target, expected_title): target
-            for target in targets
-        }
-        for future in as_completed(future_to_target):
-            target = future_to_target[future]
-            try:
-                check_results = future.result()
-            except Exception as exc:
-                LOGGER.exception("%s: unexpected error", target)
-                continue
-            for scheme, is_match, message in check_results:
-                status = "OK" if is_match else "FAIL"
-                log_message = f"[{scheme.upper()}] {target}: {status} — {message}"
-                if is_match:
-                    LOGGER.info(log_message)
-                else:
-                    LOGGER.warning(log_message)
-
-            save_results(output_path, target, check_results)
-            LOGGER.info("Results saved for %s", target.ip)
+    LOGGER.info("Starting target checks...")
+    total_processed = process_targets(all_targets, thread_count, expected_title, output_path)
+    LOGGER.info("Total targets checked: %d", total_processed)
 
 
 if __name__ == "__main__":
