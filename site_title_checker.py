@@ -251,16 +251,13 @@ def normalize_title(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def save_results(
-    output_path: Path, target: Target, check_results: List[Tuple[str, bool, str]]
-) -> bool:
-    has_match = any(is_match for _, is_match, _ in check_results)
-    if not has_match:
-        return False
+def save_results(output_path: Path, log_messages: Iterable[str]) -> None:
+    if not log_messages:
+        return
 
     with output_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"{target.ip}\n")
-    return True
+        handle.write("\n".join(log_messages))
+        handle.write("\n\n")
 
 
 def _drain_completed(
@@ -288,17 +285,24 @@ def _drain_completed(
             LOGGER.exception("%s: unexpected error", target)
             continue
 
+        log_messages: List[str] = []
+        has_match = False
+
         for scheme, is_match, message in check_results:
             status = "OK" if is_match else "FAIL"
             log_message = f"[{scheme.upper()}] {target}: {status} — {message}"
+            log_messages.append(log_message)
             if is_match:
+                has_match = True
                 LOGGER.info(log_message)
             else:
                 LOGGER.warning(log_message)
 
-        saved = save_results(output_path, target, check_results)
-        if saved:
+        save_results(output_path, log_messages)
+        if has_match:
             LOGGER.info("IP %s saved to %s", target.ip, output_path)
+        else:
+            LOGGER.debug("Results for %s recorded in %s", target, output_path)
         processed += 1
 
     return processed
