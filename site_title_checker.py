@@ -158,9 +158,17 @@ def merge_targets(base_targets: Dict[str, Set[int]], extra_ports: Iterable[int])
             yield Target(ip=ip, port=port)
 
 
+def _schemes_for_port(port: int) -> Tuple[str, ...]:
+    """Return the network schemes that should be checked for a port."""
+
+    if port == 443:
+        return ("http", "https")
+    return ("http",)
+
+
 def check_target(target: Target, expected_title: str) -> List[Tuple[str, bool, str]]:
     results: List[Tuple[str, bool, str]] = []
-    for scheme in ("http", "https"):
+    for scheme in _schemes_for_port(target.port):
         try:
             if scheme == "http":
                 connection: http.client.HTTPConnection = http.client.HTTPConnection(
