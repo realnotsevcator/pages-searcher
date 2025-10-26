@@ -15,7 +15,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 USER_AGENT = "Mozilla/5.0 (compatible; SiteTitleChecker/1.0)"
 READ_LIMIT = 65536
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
 REQUEST_ATTEMPTS = 2
 
 
@@ -164,7 +164,7 @@ def _schemes_for_port(port: int) -> Tuple[str, ...]:
     """Return the network schemes that should be checked for a port."""
 
     if port == 443:
-        return ("http", "https")
+        return ("https", "http")
     return ("http",)
 
 
@@ -200,6 +200,7 @@ def check_target(target: Target, expected_title: str) -> List[Tuple[str, bool, s
                         "Host": target.ip,
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Accept-Language": "en-US,en;q=0.5",
+                        "Connection": "close",
                     },
                 )
                 response = connection.getresponse()
@@ -352,6 +353,11 @@ def _drain_completed(
     return processed
 
 
+def _compute_max_pending(thread_count: int) -> int:
+    # Conservative queue cap: keep at least 64 tasks, but no more than 2×pool or 512.
+    return max(64, min(thread_count * 2, 512))
+
+
 def process_targets(
     targets: Iterable[Target],
     thread_count: int,
@@ -359,21 +365,17 @@ def process_targets(
     output_path: Path,
 ) -> int:
     total_processed = 0
-    max_pending = max(thread_count * 4, thread_count)
+    max_pending = _compute_max_pending(thread_count)
     matched_ips: Set[str] = set()
     file_lock = Lock()
+
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         futures: Dict[Future[List[Tuple[str, bool, str]]], Target] = {}
+
         for target in targets:
-            future = executor.submit(check_target, target, expected_title)
-            futures[future] = target
-            total_processed += _drain_completed(
-                futures,
-                output_path,
-                matched_ips,
-                file_lock,
-                wait_for_one=False,
-            )
+            # Even though each request closes its connection, a large number of
+            # in-flight attempts will still hold descriptors until they time out.
+            # Throttle submissions so we do not exceed the safe descriptor budget.
             while len(futures) >= max_pending:
                 total_processed += _drain_completed(
                     futures,
@@ -382,6 +384,17 @@ def process_targets(
                     file_lock,
                     wait_for_one=True,
                 )
+
+            future = executor.submit(check_target, target, expected_title)
+            futures[future] = target
+
+            total_processed += _drain_completed(
+                futures,
+                output_path,
+                matched_ips,
+                file_lock,
+                wait_for_one=False,
+            )
 
         while futures:
             total_processed += _drain_completed(
