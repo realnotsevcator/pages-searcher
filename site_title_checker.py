@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import http.client
+import logging
 import re
 import ssl
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,7 +13,10 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 USER_AGENT = "Mozilla/5.0 (compatible; SiteTitleChecker/1.0)"
 READ_LIMIT = 65536
-REQUEST_TIMEOUT = 5
+REQUEST_TIMEOUT = 10
+
+
+LOGGER = logging.getLogger("site_title_checker")
 
 
 @dataclass(frozen=True)
@@ -220,7 +224,23 @@ def extract_title(html_text: str) -> Optional[str]:
     return re.sub(r"\s+", " ", title)
 
 
+def save_results(
+    output_path: Path, target: Target, check_results: List[Tuple[str, bool, str]]
+) -> None:
+    lines = [
+        f"{target.ip}:{target.port} [{scheme.upper()}] {'OK' if is_match else 'FAIL'} — {message}"
+        for scheme, is_match, message in check_results
+    ]
+    with output_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     file_path = prompt_file_path()
     loaded_targets = load_targets_from_file(file_path)
     thread_count = prompt_thread_count()
@@ -234,9 +254,7 @@ def main() -> None:
 
     output_path = Path("output.txt")
     output_path.write_text("", encoding="utf-8")
-    recorded_ips: Set[str] = set()
-
-    print(f"Total targets to check: {len(targets)}")
+    LOGGER.info("Total targets to check: %d", len(targets))
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         future_to_target = {
             executor.submit(check_target, target, expected_title): target
@@ -247,19 +265,18 @@ def main() -> None:
             try:
                 check_results = future.result()
             except Exception as exc:
-                print(f"{target}: unexpected error: {exc}")
+                LOGGER.exception("%s: unexpected error", target)
                 continue
             for scheme, is_match, message in check_results:
                 status = "OK" if is_match else "FAIL"
-                print(f"[{scheme.upper()}] {target}: {status} — {message}")
+                log_message = f"[{scheme.upper()}] {target}: {status} — {message}"
+                if is_match:
+                    LOGGER.info(log_message)
+                else:
+                    LOGGER.warning(log_message)
 
-            has_http_or_https = any(
-                not message.lower().startswith("request error:") for _, _, message in check_results
-            )
-            if has_http_or_https and target.ip not in recorded_ips:
-                recorded_ips.add(target.ip)
-                with output_path.open("a", encoding="utf-8") as handle:
-                    handle.write(f"{target.ip}\n")
+            save_results(output_path, target, check_results)
+            LOGGER.info("Results saved for %s", target.ip)
 
 
 if __name__ == "__main__":
