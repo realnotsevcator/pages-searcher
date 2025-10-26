@@ -232,6 +232,10 @@ def main() -> None:
         print("No targets to check. Exiting.")
         return
 
+    output_path = Path("output.txt")
+    output_path.write_text("", encoding="utf-8")
+    recorded_ips: Set[str] = set()
+
     print(f"Total targets to check: {len(targets)}")
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         future_to_target = {
@@ -248,6 +252,14 @@ def main() -> None:
             for scheme, is_match, message in check_results:
                 status = "OK" if is_match else "FAIL"
                 print(f"[{scheme.upper()}] {target}: {status} — {message}")
+
+            has_http_or_https = any(
+                not message.lower().startswith("request error:") for _, _, message in check_results
+            )
+            if has_http_or_https and target.ip not in recorded_ips:
+                recorded_ips.add(target.ip)
+                with output_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{target.ip}\n")
 
 
 if __name__ == "__main__":
