@@ -15,7 +15,6 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 USER_AGENT = "Mozilla/5.0 (compatible; SiteTitleChecker/1.0)"
 READ_LIMIT = 65536
 REQUEST_TIMEOUT = 10
-REQUEST_ATTEMPTS = 2
 
 
 LOGGER = logging.getLogger("site_title_checker")
@@ -172,82 +171,43 @@ def check_target(target: Target, expected_title: str) -> List[Tuple[str, bool, s
     normalized_expected = normalize_title(expected_title)
 
     for scheme in _schemes_for_port(target.port):
+        connection: Optional[http.client.HTTPConnection] = None
         body: bytes = b""
         content_type: Optional[str] = None
-        success = False
-        last_exception: Optional[Exception] = None
 
-        for attempt in range(1, REQUEST_ATTEMPTS + 1):
-            connection: Optional[http.client.HTTPConnection] = None
-            response: Optional[http.client.HTTPResponse] = None
-            try:
-                if scheme == "http":
-                    connection = http.client.HTTPConnection(
-                        target.ip, target.port, timeout=REQUEST_TIMEOUT
-                    )
-                else:
-                    context = ssl._create_unverified_context()
-                    connection = http.client.HTTPSConnection(
-                        target.ip, target.port, timeout=REQUEST_TIMEOUT, context=context
-                    )
-
-                connection.request(
-                    "GET",
-                    "/",
-                    headers={
-                        "User-Agent": USER_AGENT,
-                        "Host": target.ip,
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.5",
-                    },
+        try:
+            if scheme == "http":
+                connection = http.client.HTTPConnection(
+                    target.ip, target.port, timeout=REQUEST_TIMEOUT
                 )
-                response = connection.getresponse()
-                content_type = response.getheader("Content-Type")
-                body = response.read(READ_LIMIT)
-                success = True
-                break
-            except Exception as exc:
-                last_exception = exc
-                if attempt < REQUEST_ATTEMPTS:
-                    LOGGER.debug(
-                        "%s: %s attempt %d failed, retrying",
-                        target,
-                        scheme,
-                        attempt,
-                        exc_info=True,
-                    )
-                else:
-                    LOGGER.warning(
-                        "%s: %s request failed after %d attempts",
-                        target,
-                        scheme,
-                        REQUEST_ATTEMPTS,
-                        exc_info=True,
-                    )
-            finally:
-                if response is not None:
-                    try:
-                        response.close()
-                    except Exception:
-                        LOGGER.debug(
-                            "%s: error closing response", target, exc_info=True
-                        )
-                if connection is not None:
-                    try:
-                        connection.close()
-                    except Exception:
-                        LOGGER.debug(
-                            "%s: error closing connection", target, exc_info=True
-                        )
+            else:
+                context = ssl._create_unverified_context()
+                connection = http.client.HTTPSConnection(
+                    target.ip, target.port, timeout=REQUEST_TIMEOUT, context=context
+                )
 
-        if not success:
-            error_message = (
-                f"request error after {REQUEST_ATTEMPTS} attempts: {last_exception}"
-                if last_exception
-                else "request error"
+            connection.request(
+                "GET",
+                "/",
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Host": target.ip,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                },
             )
-            results.append((scheme, False, error_message))
+            response = connection.getresponse()
+            content_type = response.getheader("Content-Type")
+            body = response.read(READ_LIMIT)
+        except Exception as exc:
+            results.append((scheme, False, f"request error: {exc}"))
             continue
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    LOGGER.debug("%s: error closing connection", target, exc_info=True)
 
         text = decode_body(body, content_type)
         title = extract_title(text)
