@@ -225,13 +225,14 @@ def extract_title(html_text: str) -> Optional[str]:
 
 def save_results(
     output_path: Path, target: Target, check_results: List[Tuple[str, bool, str]]
-) -> None:
-    lines = [
-        f"{target.ip}:{target.port} [{scheme.upper()}] {'OK' if is_match else 'FAIL'} — {message}"
-        for scheme, is_match, message in check_results
-    ]
+) -> bool:
+    has_match = any(is_match for _, is_match, _ in check_results)
+    if not has_match:
+        return False
+
     with output_path.open("a", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
+        handle.write(f"{target.ip}\n")
+    return True
 
 
 def _drain_completed(
@@ -267,8 +268,9 @@ def _drain_completed(
             else:
                 LOGGER.warning(log_message)
 
-        save_results(output_path, target, check_results)
-        LOGGER.info("Results saved for %s", target.ip)
+        saved = save_results(output_path, target, check_results)
+        if saved:
+            LOGGER.info("IP %s saved to %s", target.ip, output_path)
         processed += 1
 
     return processed
