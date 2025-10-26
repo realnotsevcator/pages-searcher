@@ -7,6 +7,7 @@ import logging
 import re
 import ssl
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from threading import Lock
 from itertools import chain
 from dataclasses import dataclass
 from pathlib import Path
@@ -291,19 +292,23 @@ def normalize_title(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def save_matched_ip(output_path: Path, ip: str, seen_ips: Set[str]) -> None:
-    if ip in seen_ips:
-        return
+def save_matched_ip(
+    output_path: Path, ip: str, seen_ips: Set[str], lock: Lock
+) -> None:
+    with lock:
+        if ip in seen_ips:
+            return
 
-    with output_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"{ip}\n")
-    seen_ips.add(ip)
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{ip}\n")
+        seen_ips.add(ip)
 
 
 def _drain_completed(
     futures: Dict[Future[List[Tuple[str, bool, str]]], Target],
     output_path: Path,
     matched_ips: Set[str],
+    lock: Lock,
     *,
     wait_for_one: bool,
 ) -> int:
@@ -338,7 +343,7 @@ def _drain_completed(
                 LOGGER.warning(log_message)
 
         if has_match:
-            save_matched_ip(output_path, target.ip, matched_ips)
+            save_matched_ip(output_path, target.ip, matched_ips, lock)
             LOGGER.info("IP %s saved to %s", target.ip, output_path)
         else:
             LOGGER.debug("Results for %s recorded in %s", target, output_path)
@@ -356,22 +361,35 @@ def process_targets(
     total_processed = 0
     max_pending = max(thread_count * 4, thread_count)
     matched_ips: Set[str] = set()
+    file_lock = Lock()
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         futures: Dict[Future[List[Tuple[str, bool, str]]], Target] = {}
         for target in targets:
             future = executor.submit(check_target, target, expected_title)
             futures[future] = target
             total_processed += _drain_completed(
-                futures, output_path, matched_ips, wait_for_one=False
+                futures,
+                output_path,
+                matched_ips,
+                file_lock,
+                wait_for_one=False,
             )
             while len(futures) >= max_pending:
                 total_processed += _drain_completed(
-                    futures, output_path, matched_ips, wait_for_one=True
+                    futures,
+                    output_path,
+                    matched_ips,
+                    file_lock,
+                    wait_for_one=True,
                 )
 
         while futures:
             total_processed += _drain_completed(
-                futures, output_path, matched_ips, wait_for_one=True
+                futures,
+                output_path,
+                matched_ips,
+                file_lock,
+                wait_for_one=True,
             )
 
     return total_processed
