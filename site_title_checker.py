@@ -14,7 +14,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 USER_AGENT = "Mozilla/5.0 (compatible; SiteTitleChecker/1.0)"
 READ_LIMIT = 65536
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 35
 
 
 LOGGER = logging.getLogger("site_title_checker")
