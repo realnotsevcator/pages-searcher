@@ -251,18 +251,19 @@ def normalize_title(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def save_results(output_path: Path, log_messages: Iterable[str]) -> None:
-    if not log_messages:
+def save_matched_ip(output_path: Path, ip: str, seen_ips: Set[str]) -> None:
+    if ip in seen_ips:
         return
 
     with output_path.open("a", encoding="utf-8") as handle:
-        handle.write("\n".join(log_messages))
-        handle.write("\n\n")
+        handle.write(f"{ip}\n")
+    seen_ips.add(ip)
 
 
 def _drain_completed(
     futures: Dict[Future[List[Tuple[str, bool, str]]], Target],
     output_path: Path,
+    matched_ips: Set[str],
     *,
     wait_for_one: bool,
 ) -> int:
@@ -285,21 +286,19 @@ def _drain_completed(
             LOGGER.exception("%s: unexpected error", target)
             continue
 
-        log_messages: List[str] = []
         has_match = False
 
         for scheme, is_match, message in check_results:
             status = "OK" if is_match else "FAIL"
             log_message = f"[{scheme.upper()}] {target}: {status} — {message}"
-            log_messages.append(log_message)
             if is_match:
                 has_match = True
                 LOGGER.info(log_message)
             else:
                 LOGGER.warning(log_message)
 
-        save_results(output_path, log_messages)
         if has_match:
+            save_matched_ip(output_path, target.ip, matched_ips)
             LOGGER.info("IP %s saved to %s", target.ip, output_path)
         else:
             LOGGER.debug("Results for %s recorded in %s", target, output_path)
@@ -316,17 +315,24 @@ def process_targets(
 ) -> int:
     total_processed = 0
     max_pending = max(thread_count * 4, thread_count)
+    matched_ips: Set[str] = set()
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         futures: Dict[Future[List[Tuple[str, bool, str]]], Target] = {}
         for target in targets:
             future = executor.submit(check_target, target, expected_title)
             futures[future] = target
-            total_processed += _drain_completed(futures, output_path, wait_for_one=False)
+            total_processed += _drain_completed(
+                futures, output_path, matched_ips, wait_for_one=False
+            )
             while len(futures) >= max_pending:
-                total_processed += _drain_completed(futures, output_path, wait_for_one=True)
+                total_processed += _drain_completed(
+                    futures, output_path, matched_ips, wait_for_one=True
+                )
 
         while futures:
-            total_processed += _drain_completed(futures, output_path, wait_for_one=True)
+            total_processed += _drain_completed(
+                futures, output_path, matched_ips, wait_for_one=True
+            )
 
     return total_processed
 
