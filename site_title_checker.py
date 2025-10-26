@@ -343,15 +343,20 @@ def main() -> None:
     ports = prompt_ports()
     expected_title = prompt_site_title()
 
+    output_path = Path("output.txt")
+    output_path.touch(exist_ok=True)
+
     targets_iter = iter(merge_targets(loaded_targets, ports))
     try:
         first_target = next(targets_iter)
     except StopIteration:
-        print("No targets to check. Exiting.")
+        message = "No targets to check. Exiting."
+        print(message)
+        output_path.write_text(message + "\n", encoding="utf-8")
+        LOGGER.info(message)
         return
 
     all_targets = chain([first_target], targets_iter)
-    output_path = Path("output.txt")
     output_path.write_text("", encoding="utf-8")
     LOGGER.info("Starting target checks...")
     total_processed = process_targets(all_targets, thread_count, expected_title, output_path)
