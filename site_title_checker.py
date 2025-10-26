@@ -14,7 +14,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 USER_AGENT = "Mozilla/5.0 (compatible; SiteTitleChecker/1.0)"
 READ_LIMIT = 65536
-REQUEST_TIMEOUT = 35
+REQUEST_TIMEOUT = 10
 
 
 LOGGER = logging.getLogger("site_title_checker")
@@ -168,10 +168,16 @@ def _schemes_for_port(port: int) -> Tuple[str, ...]:
 
 def check_target(target: Target, expected_title: str) -> List[Tuple[str, bool, str]]:
     results: List[Tuple[str, bool, str]] = []
+    normalized_expected = normalize_title(expected_title)
+
     for scheme in _schemes_for_port(target.port):
+        connection: Optional[http.client.HTTPConnection] = None
+        body: bytes = b""
+        content_type: Optional[str] = None
+
         try:
             if scheme == "http":
-                connection: http.client.HTTPConnection = http.client.HTTPConnection(
+                connection = http.client.HTTPConnection(
                     target.ip, target.port, timeout=REQUEST_TIMEOUT
                 )
             else:
@@ -193,21 +199,31 @@ def check_target(target: Target, expected_title: str) -> List[Tuple[str, bool, s
             response = connection.getresponse()
             content_type = response.getheader("Content-Type")
             body = response.read(READ_LIMIT)
-            connection.close()
         except Exception as exc:
             results.append((scheme, False, f"request error: {exc}"))
             continue
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    LOGGER.debug("%s: error closing connection", target, exc_info=True)
 
         text = decode_body(body, content_type)
         title = extract_title(text)
         if title is None:
             results.append((scheme, False, "title not found"))
             continue
-        matches = title.strip() == expected_title.strip()
+
+        matches = title == normalized_expected
         if matches:
-            results.append((scheme, True, f"match (title: '{title.strip()}')"))
+            message = f"match (title: '{title}')"
         else:
-            results.append((scheme, False, f"title '{title.strip()}' does not match"))
+            message = (
+                f"title '{title}' does not match expected '{normalized_expected}'"
+            )
+        results.append((scheme, matches, message))
+
     return results
 
 
@@ -227,8 +243,12 @@ def extract_title(html_text: str) -> Optional[str]:
     match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
     if not match:
         return None
-    title = html.unescape(match.group(1)).strip()
-    return re.sub(r"\s+", " ", title)
+    title = html.unescape(match.group(1))
+    return normalize_title(title)
+
+
+def normalize_title(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def save_results(
