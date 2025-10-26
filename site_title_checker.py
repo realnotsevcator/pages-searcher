@@ -5,6 +5,7 @@ import html
 import http.client
 import logging
 import re
+import ssl
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from itertools import chain
 from dataclasses import dataclass
@@ -157,49 +158,73 @@ def merge_targets(base_targets: Dict[str, Set[int]], extra_ports: Iterable[int])
             yield Target(ip=ip, port=port)
 
 
+def _schemes_for_port(port: int) -> Tuple[str, ...]:
+    """Return the network schemes that should be checked for a port."""
+
+    if port == 443:
+        return ("http", "https")
+    return ("http",)
+
+
 def check_target(target: Target, expected_title: str) -> List[Tuple[str, bool, str]]:
-    scheme = "http"
-    connection: Optional[http.client.HTTPConnection] = None
-    body: bytes = b""
-    content_type: Optional[str] = None
-    try:
-        connection = http.client.HTTPConnection(
-            target.ip, target.port, timeout=REQUEST_TIMEOUT
-        )
-        connection.request(
-            "GET",
-            "/",
-            headers={
-                "User-Agent": USER_AGENT,
-                "Host": target.ip,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-            },
-        )
-        response = connection.getresponse()
-        content_type = response.getheader("Content-Type")
-        body = response.read(READ_LIMIT)
-    except Exception as exc:
-        return [(scheme, False, f"request error: {exc}")]
-    finally:
-        if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                LOGGER.debug("%s: error closing connection", target, exc_info=True)
-
-    text = decode_body(body, content_type)
-    title = extract_title(text)
-    if title is None:
-        return [(scheme, False, "title not found")]
-
+    results: List[Tuple[str, bool, str]] = []
     normalized_expected = normalize_title(expected_title)
-    matches = title == normalized_expected
-    if matches:
-        message = f"match (title: '{title}')"
-    else:
-        message = f"title '{title}' does not match expected '{normalized_expected}'"
-    return [(scheme, matches, message)]
+
+    for scheme in _schemes_for_port(target.port):
+        connection: Optional[http.client.HTTPConnection] = None
+        body: bytes = b""
+        content_type: Optional[str] = None
+
+        try:
+            if scheme == "http":
+                connection = http.client.HTTPConnection(
+                    target.ip, target.port, timeout=REQUEST_TIMEOUT
+                )
+            else:
+                context = ssl._create_unverified_context()
+                connection = http.client.HTTPSConnection(
+                    target.ip, target.port, timeout=REQUEST_TIMEOUT, context=context
+                )
+
+            connection.request(
+                "GET",
+                "/",
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Host": target.ip,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                },
+            )
+            response = connection.getresponse()
+            content_type = response.getheader("Content-Type")
+            body = response.read(READ_LIMIT)
+        except Exception as exc:
+            results.append((scheme, False, f"request error: {exc}"))
+            continue
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    LOGGER.debug("%s: error closing connection", target, exc_info=True)
+
+        text = decode_body(body, content_type)
+        title = extract_title(text)
+        if title is None:
+            results.append((scheme, False, "title not found"))
+            continue
+
+        matches = title == normalized_expected
+        if matches:
+            message = f"match (title: '{title}')"
+        else:
+            message = (
+                f"title '{title}' does not match expected '{normalized_expected}'"
+            )
+        results.append((scheme, matches, message))
+
+    return results
 
 
 def decode_body(body: bytes, content_type: Optional[str]) -> str:
