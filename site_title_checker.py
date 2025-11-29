@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import codecs
 import csv
-import html
-import http.client
 import importlib.util
 import logging
+import os
 import re
-import ssl
+import shutil
 from encodings import aliases
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -24,10 +23,27 @@ if CHARSET_NORMALIZER_AVAILABLE:
 else:
     _normalize_from_bytes = None
 
+SELENIUM_AVAILABLE = importlib.util.find_spec("selenium") is not None
+if not SELENIUM_AVAILABLE:
+    raise ImportError("Selenium is required to run this script.")
+
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.utils import ChromeType
+
 USER_AGENT = "Mozilla/5.0 (compatible; SiteTitleChecker/1.0)"
-READ_LIMIT = 65536
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 30
 REQUEST_ATTEMPTS = 2
+TITLE_WAIT_TIMEOUT = 30
+
+
+_DRIVER_PATH: Optional[str] = None
+_BINARY_LOCATION: Optional[str] = None
+_DRIVER_LOCK = Lock()
 
 
 LOGGER = logging.getLogger("site_title_checker")
@@ -203,46 +219,121 @@ class MatchResult:
     title: Optional[str]
 
 
+def _create_driver() -> webdriver.Chrome:
+    options = ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--disable-extensions")
+    options.add_argument(f"--user-agent={USER_AGENT}")
+
+    driver_path, binary_location = _ensure_webdriver()
+    if binary_location:
+        options.binary_location = binary_location
+    service = Service(driver_path)
+
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(REQUEST_TIMEOUT)
+    driver.set_script_timeout(REQUEST_TIMEOUT)
+    return driver
+
+
+def _ensure_webdriver() -> Tuple[str, Optional[str]]:
+    """Ensure Chrome/Chromium and its driver are present, downloading via webdriver_manager."""
+
+    global _DRIVER_PATH, _BINARY_LOCATION
+
+    with _DRIVER_LOCK:
+        if _DRIVER_PATH is not None:
+            return _DRIVER_PATH, _BINARY_LOCATION
+
+        binary_location = _find_browser_binary()
+        chrome_type = ChromeType.GOOGLE if binary_location else ChromeType.CHROMIUM
+
+        driver_path = ChromeDriverManager(chrome_type=chrome_type).install()
+
+        if binary_location is None:
+            binary_location = _find_browser_binary(prefer_chromium=True)
+
+        _DRIVER_PATH = driver_path
+        _BINARY_LOCATION = binary_location
+        return driver_path, binary_location
+
+
+def _find_browser_binary(prefer_chromium: bool = False) -> Optional[str]:
+    browser_candidates = []
+
+    env_binary = (os.environ.get("CHROME_BINARY") or os.environ.get("GOOGLE_CHROME_BIN") or "").strip()
+    if env_binary:
+        browser_candidates.append(env_binary)
+
+    chrome_names = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chrome",
+    ]
+
+    chromium_names = [
+        "chromium",
+        "chromium-browser",
+        "chrome-browser",
+    ]
+
+    if prefer_chromium:
+        browser_candidates.extend(chromium_names + chrome_names)
+    else:
+        browser_candidates.extend(chrome_names + chromium_names)
+
+    for name in browser_candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+
+    return None
+
+
+def _wait_for_title(driver: webdriver.Chrome) -> Optional[str]:
+    wait = WebDriverWait(driver, TITLE_WAIT_TIMEOUT)
+    try:
+        return wait.until(
+            lambda d: _normalize_if_present(d.title)
+        )
+    except TimeoutException:
+        raw_title = driver.title
+        if not raw_title:
+            return None
+        normalized = normalize_title(raw_title)
+        return normalized if normalized else None
+
+
+def _normalize_if_present(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    normalized = normalize_title(value)
+    return normalized if normalized else None
+
+
 def check_target(target: Target, rules: List[MatchRule]) -> List[MatchResult]:
     results: List[MatchResult] = []
 
     for scheme in _schemes_for_port(target.port):
-        body: bytes = b""
-        content_type: Optional[str] = None
         success = False
         last_exception: Optional[Exception] = None
+        title: Optional[str] = None
+
+        url = f"{scheme}://{target.ip}:{target.port}/"
 
         for attempt in range(1, REQUEST_ATTEMPTS + 1):
-            connection: Optional[http.client.HTTPConnection] = None
-            response: Optional[http.client.HTTPResponse] = None
+            driver: Optional[webdriver.Chrome] = None
             try:
-                if scheme == "http":
-                    connection = http.client.HTTPConnection(
-                        target.ip, target.port, timeout=REQUEST_TIMEOUT
-                    )
-                else:
-                    context = ssl._create_unverified_context()
-                    connection = http.client.HTTPSConnection(
-                        target.ip, target.port, timeout=REQUEST_TIMEOUT, context=context
-                    )
-
-                connection.request(
-                    "GET",
-                    "/",
-                    headers={
-                        "User-Agent": USER_AGENT,
-                        "Host": target.ip,
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.5",
-                        "Connection": "close",
-                    },
-                )
-                response = connection.getresponse()
-                content_type = response.getheader("Content-Type")
-                body = response.read(READ_LIMIT)
+                driver = _create_driver()
+                driver.get(url)
+                title = _wait_for_title(driver)
                 success = True
                 break
-            except Exception as exc:
+            except (TimeoutException, WebDriverException, Exception) as exc:
                 last_exception = exc
                 if attempt < REQUEST_ATTEMPTS:
                     LOGGER.debug(
@@ -261,19 +352,12 @@ def check_target(target: Target, rules: List[MatchRule]) -> List[MatchResult]:
                         exc_info=True,
                     )
             finally:
-                if response is not None:
+                if driver is not None:
                     try:
-                        response.close()
+                        driver.quit()
                     except Exception:
                         LOGGER.debug(
-                            "%s: error closing response", target, exc_info=True
-                        )
-                if connection is not None:
-                    try:
-                        connection.close()
-                    except Exception:
-                        LOGGER.debug(
-                            "%s: error closing connection", target, exc_info=True
+                            "%s: error closing webdriver", target, exc_info=True
                         )
 
         if not success:
@@ -287,18 +371,15 @@ def check_target(target: Target, rules: List[MatchRule]) -> List[MatchResult]:
             )
             continue
 
-        text = decode_body(body, content_type)
-        title = extract_title(text)
         if title is None:
             results.append(
                 MatchResult(scheme=scheme, is_match=False, message="title not found", title=None)
             )
             continue
 
-        normalized_title = normalize_title(title)
-        is_match = any(rule.matches(normalized_title) for rule in rules)
+        is_match = any(rule.matches(title) for rule in rules)
         message = (
-            f"match (title: '{normalized_title}')"
+            f"match (title: '{title}')"
             if is_match
             else "title does not match any rule"
         )
@@ -307,10 +388,9 @@ def check_target(target: Target, rules: List[MatchRule]) -> List[MatchResult]:
                 scheme=scheme,
                 is_match=is_match,
                 message=message,
-                title=normalized_title,
+                title=title,
             )
         )
-
     return results
 
 
@@ -366,31 +446,6 @@ def _decode_with_all_encodings(
             continue
 
     return data.decode("utf-8", errors="replace")
-
-
-def decode_body(body: bytes, content_type: Optional[str]) -> str:
-    preferred_encodings: List[str] = []
-    if content_type:
-        match = re.search(r"charset=([\w-]+)", content_type, re.IGNORECASE)
-        if match:
-            preferred_encodings.append(match.group(1).lower())
-
-    head_fragment = body[:16384].decode("ascii", errors="ignore")
-    meta_match = re.search(r"charset=['\"]?([\w-]+)", head_fragment, re.IGNORECASE)
-    if meta_match:
-        preferred_encodings.append(meta_match.group(1).lower())
-
-    preferred_encodings.append("utf-8")
-
-    return _decode_with_all_encodings(body, preferred_encodings)
-
-
-def extract_title(html_text: str) -> Optional[str]:
-    match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    title = html.unescape(match.group(1))
-    return normalize_title(title)
 
 
 def normalize_title(value: str) -> str:
