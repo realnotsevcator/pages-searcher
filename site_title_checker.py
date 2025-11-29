@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import codecs
-import csv
 import importlib.util
 import logging
 import os
@@ -13,7 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 CHARSET_NORMALIZER_AVAILABLE = (
     importlib.util.find_spec("charset_normalizer") is not None
@@ -58,70 +57,6 @@ class Target:
         return f"{self.ip}:{self.port}"
 
 
-def prompt_file_path() -> Path:
-    while True:
-        path_input = input("Enter the path to the .txt file: ").strip()
-        if not path_input:
-            print("The path cannot be empty. Try again.")
-            continue
-        path = Path(path_input)
-        if path.is_file():
-            return path
-        print(f"File '{path}' not found. Check the path and try again.")
-
-
-def load_targets_from_file(path: Path) -> Dict[str, Set[int]]:
-    targets: Dict[str, Set[int]] = {}
-    for line_number, raw_line in enumerate(_read_lines_any_encoding(path), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        ip: Optional[str] = None
-        port: Optional[int] = None
-
-        if line.startswith("[") and "]" in line:
-            host_part, remainder = line[1:].split("]", 1)
-            ip = host_part.strip()
-            remainder = remainder.strip()
-            if remainder.startswith(":"):
-                port_str = remainder[1:]
-                port = _parse_port(port_str, line_number)
-        elif ":" in line:
-            ip_part, port_str = line.rsplit(":", 1)
-            ip = ip_part.strip()
-            port = _parse_port(port_str, line_number)
-        else:
-            ip = line
-
-        if not ip:
-            print(f"Line {line_number}: unable to determine IP address. Skipping.")
-            continue
-
-        if port is not None and port == 0:
-            continue
-
-        ip_targets = targets.setdefault(ip, set())
-        if port is not None:
-            ip_targets.add(port)
-
-    return targets
-
-
-def _parse_port(port_str: str, line_number: int) -> Optional[int]:
-    port_str = port_str.strip()
-    if not port_str:
-        return None
-    if not port_str.isdigit():
-        print(f"Line {line_number}: port '{port_str}' is not an integer. Skipping.")
-        return None
-    port = int(port_str)
-    if not (1 <= port <= 65535):
-        print(f"Line {line_number}: port '{port}' is outside the range 1-65535. Skipping.")
-        return None
-    return port
-
-
 def prompt_thread_count() -> int:
     while True:
         value = input("Enter the number of threads: ").strip()
@@ -136,54 +71,6 @@ def prompt_thread_count() -> int:
             print("Thread count must be positive.")
             continue
         return count
-
-
-def prompt_ports() -> Set[int]:
-    while True:
-        value = input("Enter ports separated by commas (for example, 80 or 80,443,8080): ").strip()
-        if not value:
-            print("The list of ports cannot be empty. Try again.")
-            continue
-        parts = [part.strip() for part in value.split(",") if part.strip()]
-        if not parts:
-            print("The list of ports cannot be empty. Try again.")
-            continue
-        ports: Set[int] = set()
-        invalid_parts: List[str] = []
-        for part in parts:
-            if not part.isdigit():
-                invalid_parts.append(part)
-                continue
-            port = int(part)
-            if not (1 <= port <= 65535):
-                invalid_parts.append(part)
-                continue
-            ports.add(port)
-        if invalid_parts:
-            print("Invalid ports: " + ", ".join(invalid_parts) + ". Try again.")
-            continue
-        return ports
-
-
-def prompt_site_title() -> str:
-    while True:
-        value = input("Enter the expected site title: ").strip()
-        if not value:
-            print("The site title cannot be empty. Try again.")
-            continue
-        return value
-
-
-def merge_targets(base_targets: Dict[str, Set[int]], extra_ports: Iterable[int]) -> Iterable[Target]:
-    extra_ports_set = set(extra_ports)
-    for ip, ports in base_targets.items():
-        all_ports = set(ports)
-        all_ports.update(extra_ports_set)
-        if not all_ports:
-            print(f"No ports specified for IP {ip}. Skipping.")
-            continue
-        for port in sorted(all_ports):
-            yield Target(ip=ip, port=port)
 
 
 def _schemes_for_port(port: int) -> Tuple[str, ...]:
@@ -551,13 +438,10 @@ class OutputManager:
     output_ip_port: Path
     output_ip_port_title: Path
     output_unmatched: Path
-    output_csv: Path
     seen_ips: Set[str]
     seen_ip_ports: Set[str]
     seen_ip_port_titles: Set[str]
     seen_unmatched_titles: Set[str]
-    csv_writer: csv.writer
-    csv_file: Any
     lock: Lock
 
     @classmethod
@@ -566,33 +450,24 @@ class OutputManager:
         output_ip_port = Path("output_v2.txt")
         output_ip_port_title = Path("output_v3.txt")
         output_unmatched = Path("unmatched.txt")
-        output_csv = Path("output.csv")
 
         for path in (output_ip, output_ip_port, output_ip_port_title, output_unmatched):
             path.write_text("", encoding="utf-8")
-
-        csv_file = output_csv.open("w", encoding="utf-8", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["Link", "IP", "Port", "Name of page"])
 
         return cls(
             output_ip=output_ip,
             output_ip_port=output_ip_port,
             output_ip_port_title=output_ip_port_title,
             output_unmatched=output_unmatched,
-            output_csv=output_csv,
             seen_ips=set(),
             seen_ip_ports=set(),
             seen_ip_port_titles=set(),
             seen_unmatched_titles=set(),
-            csv_writer=csv_writer,
-            csv_file=csv_file,
             lock=Lock(),
         )
 
     def close(self) -> None:
-        with self.lock:
-            self.csv_file.close()
+        return None
 
     def record_match(self, target: Target, scheme: str, title: str) -> None:
         with self.lock:
@@ -612,9 +487,6 @@ class OutputManager:
                 with self.output_ip_port_title.open("a", encoding="utf-8") as handle:
                     handle.write(f"{ip_port_title}\n")
                 self.seen_ip_port_titles.add(ip_port_title)
-
-            link = f"{scheme}://{ip_port}/"
-            self.csv_writer.writerow([link, target.ip, target.port, title])
 
     def record_unmatched(self, target: Target, title: str) -> None:
         with self.lock:
