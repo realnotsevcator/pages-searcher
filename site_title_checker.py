@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 from encodings import aliases
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -31,8 +32,6 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.utils import ChromeType
 
 USER_AGENT = "Mozilla/5.0 (compatible; SiteTitleChecker/1.0)"
 REQUEST_TIMEOUT = 30
@@ -116,10 +115,15 @@ def _create_driver() -> webdriver.Chrome:
     options.add_argument("--disable-extensions")
     options.add_argument(f"--user-agent={USER_AGENT}")
 
-    driver_path, binary_location = _ensure_webdriver()
-    if binary_location:
-        options.binary_location = binary_location
-    service = Service(driver_path)
+    # Path to the current user's temp directory, e.g.:
+    # C:\Users\Other user.AMFB_NEW\AppData\Local\Temp\selenium-bin
+    base_temp = Path(tempfile.gettempdir()) / "selenium-bin"
+
+    # Location of chrome.exe
+    options.binary_location = str(base_temp / "chrome.exe")
+
+    # Location of chromedriver.exe
+    service = Service(str(base_temp / "chromedriver.exe"))
 
     driver = webdriver.Chrome(service=service, options=options)
     driver.set_page_load_timeout(REQUEST_TIMEOUT)
