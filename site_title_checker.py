@@ -12,7 +12,7 @@ from encodings import aliases
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 CHARSET_NORMALIZER_AVAILABLE = (
@@ -240,6 +240,45 @@ def _create_driver() -> webdriver.Chrome:
     return driver
 
 
+class _DriverPool:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._thread_local = local()
+        self._drivers: Set[webdriver.Chrome] = set()
+
+    def current(self) -> webdriver.Chrome:
+        driver = getattr(self._thread_local, "driver", None)
+        if driver is None:
+            driver = _create_driver()
+            self._thread_local.driver = driver
+            with self._lock:
+                self._drivers.add(driver)
+        return driver
+
+    def reset_current(self) -> None:
+        driver = getattr(self._thread_local, "driver", None)
+        if driver is None:
+            return
+        try:
+            driver.quit()
+        except Exception:
+            LOGGER.debug("error closing webdriver for thread", exc_info=True)
+        finally:
+            with self._lock:
+                self._drivers.discard(driver)
+            self._thread_local.driver = None
+
+    def close_all(self) -> None:
+        with self._lock:
+            drivers = list(self._drivers)
+            self._drivers.clear()
+        for driver in drivers:
+            try:
+                driver.quit()
+            except Exception:
+                LOGGER.debug("error closing webdriver on shutdown", exc_info=True)
+
+
 def _ensure_webdriver() -> Tuple[str, Optional[str]]:
     """Ensure Chrome/Chromium and its driver are present, downloading via webdriver_manager."""
 
@@ -315,7 +354,9 @@ def _normalize_if_present(value: Optional[str]) -> Optional[str]:
     return normalized if normalized else None
 
 
-def check_target(target: Target, rules: List[MatchRule]) -> List[MatchResult]:
+def check_target(
+    target: Target, rules: List[MatchRule], driver_pool: _DriverPool
+) -> List[MatchResult]:
     results: List[MatchResult] = []
 
     for scheme in _schemes_for_port(target.port):
@@ -326,15 +367,15 @@ def check_target(target: Target, rules: List[MatchRule]) -> List[MatchResult]:
         url = f"{scheme}://{target.ip}:{target.port}/"
 
         for attempt in range(1, REQUEST_ATTEMPTS + 1):
-            driver: Optional[webdriver.Chrome] = None
             try:
-                driver = _create_driver()
+                driver = driver_pool.current()
                 driver.get(url)
                 title = _wait_for_title(driver)
                 success = True
                 break
             except (TimeoutException, WebDriverException, Exception) as exc:
                 last_exception = exc
+                driver_pool.reset_current()
                 if attempt < REQUEST_ATTEMPTS:
                     LOGGER.debug(
                         "%s: %s attempt %d failed, retrying",
@@ -351,14 +392,6 @@ def check_target(target: Target, rules: List[MatchRule]) -> List[MatchResult]:
                         REQUEST_ATTEMPTS,
                         exc_info=True,
                     )
-            finally:
-                if driver is not None:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        LOGGER.debug(
-                            "%s: error closing webdriver", target, exc_info=True
-                        )
 
         if not success:
             error_message = (
@@ -653,6 +686,7 @@ def process_targets(
 ) -> int:
     total_processed = 0
     max_pending = _compute_max_pending(thread_count)
+    driver_pool = _DriverPool()
 
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         futures: Dict[Future[List[MatchResult]], Target] = {}
@@ -668,7 +702,7 @@ def process_targets(
                     wait_for_one=True,
                 )
 
-            future = executor.submit(check_target, target, rules)
+            future = executor.submit(check_target, target, rules, driver_pool)
             futures[future] = target
 
             total_processed += _drain_completed(
@@ -683,6 +717,8 @@ def process_targets(
                 outputs,
                 wait_for_one=True,
             )
+
+    driver_pool.close_all()
 
     return total_processed
 
