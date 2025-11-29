@@ -462,10 +462,12 @@ class OutputManager:
     output_ip: Path
     output_ip_port: Path
     output_ip_port_title: Path
+    output_unmatched: Path
     output_csv: Path
     seen_ips: Set[str]
     seen_ip_ports: Set[str]
     seen_ip_port_titles: Set[str]
+    seen_unmatched_titles: Set[str]
     csv_writer: csv.writer
     csv_file: Any
     lock: Lock
@@ -475,9 +477,10 @@ class OutputManager:
         output_ip = Path("output.txt")
         output_ip_port = Path("output_v2.txt")
         output_ip_port_title = Path("output_v3.txt")
+        output_unmatched = Path("unmatched.txt")
         output_csv = Path("output.csv")
 
-        for path in (output_ip, output_ip_port, output_ip_port_title):
+        for path in (output_ip, output_ip_port, output_ip_port_title, output_unmatched):
             path.write_text("", encoding="utf-8")
 
         csv_file = output_csv.open("w", encoding="utf-8", newline="")
@@ -488,10 +491,12 @@ class OutputManager:
             output_ip=output_ip,
             output_ip_port=output_ip_port,
             output_ip_port_title=output_ip_port_title,
+            output_unmatched=output_unmatched,
             output_csv=output_csv,
             seen_ips=set(),
             seen_ip_ports=set(),
             seen_ip_port_titles=set(),
+            seen_unmatched_titles=set(),
             csv_writer=csv_writer,
             csv_file=csv_file,
             lock=Lock(),
@@ -522,6 +527,16 @@ class OutputManager:
 
             link = f"{scheme}://{ip_port}/"
             self.csv_writer.writerow([link, target.ip, target.port, title])
+
+    def record_unmatched(self, target: Target, title: str) -> None:
+        with self.lock:
+            ip_port_title = f"{target.ip}:{target.port}@{title}"
+            if ip_port_title in self.seen_unmatched_titles:
+                return
+
+            with self.output_unmatched.open("a", encoding="utf-8") as handle:
+                handle.write(f"{ip_port_title}\n")
+            self.seen_unmatched_titles.add(ip_port_title)
 
 
 def _drain_completed(
@@ -560,6 +575,8 @@ def _drain_completed(
                 LOGGER.info(log_message)
             else:
                 LOGGER.warning(log_message)
+                if result.title:
+                    outputs.record_unmatched(target, result.title)
 
         if not has_match:
             LOGGER.debug("Results for %s recorded without matches", target)
