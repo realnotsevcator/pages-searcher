@@ -569,13 +569,13 @@ def _drain_completed(
         for result in check_results:
             status = "OK" if result.is_match else "FAIL"
             log_message = f"[{result.scheme.upper()}] {target}: {status} — {result.message}"
-            if result.is_match and result.title:
+            if result.is_match and result.title is not None:
                 has_match = True
                 outputs.record_match(target, result.scheme, result.title)
                 LOGGER.info(log_message)
             else:
                 LOGGER.warning(log_message)
-                if result.title:
+                if result.title is not None:
                     outputs.record_unmatched(target, result.title)
 
         if not has_match:
